@@ -2,7 +2,7 @@ name: Build & Push to ECR (Secrets with Account ID)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "dev" ]
 
 jobs:
   build-and-push:
@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # 5) AWS 자격 증명 설정 (Secrets 사용)
+      # 3) AWS 자격 증명 설정
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -31,36 +31,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # 6) ECR 로그인 (계정 ID를 Secret에서 참조)
+      # 4) ECR 로그인
       - name: ECR Login
         run: |
           aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
             | docker login --username AWS --password-stdin \
               ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
-      # 7) (선택) 이미지 태그 구성: 커밋 해시 7자리 + latest
+      # 5) 이미지 태그 구성
       - name: Prepare tags
         id: prep
         run: |
           echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
           echo "REPO_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/my-app-repo" >> $GITHUB_ENV
 
+      # 6) Gradle 권한 부여
       - name: Gradle Wrapper 실행 권한 부여
         run: chmod +x ./gradlew
 
-      # 8) Docker 빌드 (앞 단계에서 만든 JAR을 이미지에 복사)
+      # 7) Docker 빌드
       - name: Docker build
         run: |
           docker build -t "$REPO_URI:$IMAGE_TAG" -t "$REPO_URI:latest" .
 
-      # 9) ECR 푸시
+      # 8) ECR 푸시
       - name: Docker push
         run: |
           docker push "$REPO_URI:$IMAGE_TAG"
           docker push "$REPO_URI:latest"
 
-      # 10) 작업 정의 템플릿 렌더링 (envsubst로 변수 치환)
-      #     - ecs-task-def.json 내 ${AWS_ACCOUNT_ID}, ${AWS_REGION}, ${IMAGE_TAG} 치환
+      # 9) 작업 정의 템플릿 렌더링
       - name: Render task definition
         run: |
           sudo apt-get update -y && sudo apt-get install -y gettext-base
@@ -71,28 +71,36 @@ jobs:
           echo "=== Rendered task def ==="
           cat task-def.rendered.json
 
-      # 11) 작업 정의 업데이트 (새 리비전 등록)
-      - name: 작업 정의 업데이트
-        run: |
-          aws ecs register-task-definition \
-            --cli-input-json file://task-def.rendered.json
+      # 🔧 10) jq 설치 (JSON 파싱용)
+      - name: Install jq
+        run: sudo apt-get install -y jq
 
-      # 12) ECS 서비스 업데이트 (새 작업 정의 강제 배포)
+      # ✅ 11) 작업 정의 등록 & ARN 추출
+      - name: Register task definition and extract ARN
+        id: register_task
+        run: |
+          REVISION_JSON=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def.rendered.json)
+          TASK_DEF_ARN=$(echo $REVISION_JSON | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
+      # ✅ 12) ECS 서비스 업데이트 (정확한 리비전 사용)
       - name: ECS 서비스 업데이트
         run: |
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition $TASK_DEF_ARN \
             --force-new-deployment
 
-      # 13) 배포 완료 대기 (서비스가 안정 상태가 될 때까지)
+      # 13) 배포 완료 대기
       - name: ECS 배포 완료 대기
         run: |
           aws ecs wait services-stable \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --services ${{ secrets.ECS_SERVICE }}
 
-      # 14) 배포 상태 확인 (디플로이먼트 요약 출력)
+      # 14) 배포 상태 확인
       - name: ECS 배포 상태 확인
         run: |
           aws ecs describe-services \
